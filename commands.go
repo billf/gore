@@ -14,6 +14,8 @@ import (
 
 	"go/ast"
 	"go/build"
+	"go/parser"
+	"go/token"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/types"
 )
@@ -27,7 +29,6 @@ type command struct {
 }
 
 // TODO
-// - :edit
 // - :undo
 // - :reset
 // - :type
@@ -58,6 +59,11 @@ func init() {
 			complete: nil, // TODO implement
 			arg:      "[<file>]",
 			document: "write out current source",
+		},
+		{
+			name:     "edit",
+			action:   actionEdit,
+			document: "edit current source in $EDITOR",
 		},
 		{
 			name:     "doc",
@@ -213,6 +219,85 @@ func actionWrite(s *Session, filename string) error {
 
 	infof("Source wrote to %s", filename)
 
+	return nil
+}
+
+func actionEdit(s *Session, _ string) error {
+	source, err := s.source(true)
+	if err != nil {
+		return err
+	}
+
+	var filename string
+	if f, err := ioutil.TempFile("", "gore_session"); err != nil {
+		errorf("failed to create tempfile: %v", err)
+		return err
+	} else {
+		err = os.Rename(f.Name(), f.Name()+".go")
+		filename = f.Name() + ".go"
+		defer func() {
+			f.Close()
+			os.Remove(filename)
+		}()
+		_, err = f.Write([]byte(source))
+		if err != nil {
+			errorf("failed to write tempfile")
+			return err
+		}
+	}
+
+	ed := os.Getenv("VISUAL")
+	if ed == "" {
+		ed = os.Getenv("EDITOR")
+	}
+	if ed == "" {
+		ed = "ed"
+	}
+
+	cmd := exec.Command("sh", "-c", ed+` "$@"`, "$EDITOR", filename)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		errorf("failed to open editor: %v\n\t%v", err, cmd)
+		return err
+	}
+	debugf("Edited %s", filename)
+	edited, err := ioutil.ReadFile(filename)
+	if err != nil {
+		errorf("cannot read edited file: %v", err)
+		return err
+	}
+
+	s.clearQuickFix()
+
+	fset := token.NewFileSet()
+	updatedImports, err := parser.ParseFile(fset, "imports", edited, parser.ImportsOnly)
+	if updatedImports == nil || err != nil {
+		errorf("cannot parse edited imports: %v", err)
+		return err
+	}
+	for _, imt := range updatedImports.Imports {
+		debugf("import package: %s", imt.Path.Value)
+		if err := actionImport(s, imt.Path.Value); err != nil {
+			errorf("cannot imports edited packages: %v", err)
+			return err
+		}
+	}
+	debugf("parsed imports: %v", updatedImports)
+
+	//	fset = token.NewFileSet()
+	parsed, err := parser.ParseFile(s.Fset, "gore_session.go", edited, parser.AllErrors)
+	if parsed == nil || err != nil {
+		errorf("cannot parse edited file: %v", err)
+		return err
+	}
+	debugf("parsed file: %+v", parsed)
+	// ast.Print(s.Fset, parsed) //, nil)
+	s.File = parsed
+	s.mainBody = s.mainFunc().Body
+	// TODO: back off if parsing new file fails?
+	// TODO: prevent editing of printerName (__gore_pp)?
 	return nil
 }
 
